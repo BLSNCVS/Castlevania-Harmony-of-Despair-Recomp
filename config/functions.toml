@@ -1,0 +1,29 @@
+# Hand-maintained codegen overrides for default.xex.
+#
+# Every address here is for the title-update-patched image (TU 0.0.2.4 over
+# base 0.0.1.4, see docs/SUPPORTED_DUMPS.md). Keep them in sync if the
+# supported dump ever changes.
+# Reference: https://github.com/rexglue/rexglue-sdk/wiki/rexglue-CLI-Configuration-File
+
+[functions]
+# C++ this-adjustor thunks reached only by tail branches from other thunks,
+# so the analyzer never registers them:
+#   826609B0  addi r3,r3,8 ; b 0x8265F248   (0x826609B8 adjusts by -8 and jumps here)
+#   8266EB68  b 0x8266B1E0                  (jumped to from 0x8266B6B4 and 0x8266EC34)
+0x826609B0 = { size = 8 }
+0x8266EB68 = { size = 4 }
+
+# Switch tables the analyzer can't bound. These dispatch through a byte
+# table with no range check (the compiler knew the value's range), so the
+# analyzer read past the end into the next function's table.
+
+# sub_8279B498: byte table at 0x82068E80, 12 entries, target = 0x8279B4E0 + 4*byte.
+# Case 4 tail-jumps to sub_8279B5E8.
+[[switch_tables]]
+address = 0x8279B4DC
+register = 11
+labels = [
+    0x8279B510, 0x8279B510, 0x8279B510, 0x8279B510,
+    0x8279B5E8, 0x8279B510, 0x8279B510, 0x8279B510,
+    0x8279B510, 0x8279B4E0, 0x8279B510, 0x8279B510,
+]

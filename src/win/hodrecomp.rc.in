@@ -1,0 +1,32 @@
+// harmony-recomp - Windows executable resources (configured by CMake).
+// Kept free of #include so any resource compiler (rc.exe, llvm-rc) takes it.
+
+1 ICON "@HODRECOMP_ICON@"
+
+1 VERSIONINFO
+FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Harmony Recomp"
+            VALUE "FileVersion", "@PROJECT_VERSION@"
+            VALUE "InternalName", "hodrecomp"
+            VALUE "OriginalFilename", "hodrecomp.exe"
+            VALUE "ProductName", "Harmony Recomp"
+            VALUE "ProductVersion", "@PROJECT_VERSION@"
+            VALUE "Comments", "Unofficial PC port built from your own copy of Castlevania: Harmony of Despair (Xbox 360)."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,105 @@
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 9b9cf9e..7e9799d 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -333,6 +333,15 @@ class KernelState {
+   AchievementManager& achievements() { return achievement_manager_; }
+   const AchievementManager& achievements() const { return achievement_manager_; }
+ 
++  // The app's achievement list for XamShowAchievementsUI. It runs on the UI
++  // thread and calls `closed` once the player leaves it. Without one the call
++  // does nothing, as before.
++  using SystemUIHandler = std::function<void(std::function<void()> closed)>;
++  void SetAchievementsUIHandler(SystemUIHandler handler) {
++    achievements_ui_handler_ = std::move(handler);
++  }
++  const SystemUIHandler& achievements_ui_handler() const { return achievements_ui_handler_; }
++
+   using AchievementUnlockCallback = std::function<void(const AchievementInfo&)>;
+   AchievementListenerHandle RegisterAchievementUnlockCallback(AchievementUnlockCallback cb);
+ 
+@@ -387,6 +396,7 @@ class KernelState {
+   uint32_t kernel_guest_globals_ = 0;
+ 
+   AchievementManager achievement_manager_;
++  SystemUIHandler achievements_ui_handler_;
+ 
+   std::atomic<bool> dispatch_thread_running_;
+   std::atomic<bool> terminating_title_{false};
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..de93d1a 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -28,6 +28,7 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++REXCVAR_DEFINE_BOOL(input_vibration, true, "Input", "Controller vibration (rumble)");
+ namespace rex::input {
+ 
+ namespace {
+@@ -261,6 +262,11 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+   std::vector<DeviceId> ids;
+   assignment_->DevicesForUser(user_index, ids);
+ 
++  X_INPUT_VIBRATION stopped{};
++  if (!REXCVAR_GET(input_vibration)) {
++    vibration = &stopped;
++  }
++
+   // Every pad on this user belongs to the same player, so all of them buzz.
+   // Only pads decide the result: synthetic devices accept any vibration and
+   // would otherwise report success for a pad that never rumbled.
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 5a572ce..6d3cb1b 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -560,6 +560,30 @@ uint32_t XamShowMessageBoxUIEx_entry() {
+   return 0;
+ }
+ 
++u32 XamShowAchievementsUI_entry(u32 user_index) {
++  auto* kernel_state = REX_KERNEL_STATE();
++  auto* app_context = kernel_state->emulator()->app_context();
++  const auto& handler = kernel_state->achievements_ui_handler();
++  if (!handler || !app_context) {
++    REXKRNL_WARN("XamShowAchievementsUI({}): no achievements UI", uint32_t(user_index));
++    return X_ERROR_SUCCESS;
++  }
++  // The guide opens over the running title, which pauses on XN_SYS_UI.
++  kernel_state->BroadcastNotification(0x9, true);
++  ++xam_dialogs_shown_;
++  app_context->CallInUIThread([handler]() {
++    handler([]() {
++      --xam_dialogs_shown_;
++      REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
++    });
++  });
++  return X_ERROR_SUCCESS;
++}
++
++u32 XamShowAchievementsUIEx_entry(u32 user_index) {
++  return XamShowAchievementsUI_entry(user_index);
++}
++
+ }  // namespace xam
+ }  // namespace kernel
+ }  // namespace rex
+@@ -572,6 +596,8 @@ REX_EXPORT(__imp__XamShowDirtyDiscErrorUI, rex::kernel::xam::XamShowDirtyDiscErr
+ REX_EXPORT(__imp__XamShowPartyUI, rex::kernel::xam::XamShowPartyUI_entry)
+ REX_EXPORT(__imp__XamShowCommunitySessionsUI, rex::kernel::xam::XamShowCommunitySessionsUI_entry)
+ REX_EXPORT(__imp__XamShowMessageBoxUIEx, rex::kernel::xam::XamShowMessageBoxUIEx_entry)
++REX_EXPORT(__imp__XamShowAchievementsUI, rex::kernel::xam::XamShowAchievementsUI_entry)
++REX_EXPORT(__imp__XamShowAchievementsUIEx, rex::kernel::xam::XamShowAchievementsUIEx_entry)
+ 
+ REX_EXPORT_STUB(__imp__XamIsGuideDisabled);
+ REX_EXPORT_STUB(__imp__XamIsMessageBoxActive);
+@@ -583,8 +609,6 @@ REX_EXPORT_STUB(__imp__XamNavigate);
+ REX_EXPORT_STUB(__imp__XamNavigateBack);
+ REX_EXPORT_STUB(__imp__XamOverrideHudOpenType);
+ REX_EXPORT_STUB(__imp__XamShowAchievementDetailsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUI);
+-REX_EXPORT_STUB(__imp__XamShowAchievementsUIEx);
+ REX_EXPORT_STUB(__imp__XamShowAndWaitForMessageBoxEx);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardGamesUI);
+ REX_EXPORT_STUB(__imp__XamShowAvatarAwardsUI);

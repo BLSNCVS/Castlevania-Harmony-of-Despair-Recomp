@@ -1,0 +1,119 @@
+diff --git a/include/rex/system/user_module.h b/include/rex/system/user_module.h
+index c1abe63..baa54a3 100644
+--- a/include/rex/system/user_module.h
++++ b/include/rex/system/user_module.h
+@@ -65,6 +65,12 @@ class UserModule : public XModule {
+   bool evicted() const { return evicted_; }
+   void set_evicted() { evicted_ = true; }
+ 
++  // Guest path of the recompiled code wired to this module (the key in
++  // KernelState's recompiled module list), or empty. path() is the resolved
++  // device path, which doesn't match that list.
++  const std::string& recomp_key() const { return recomp_key_; }
++  void set_recomp_key(std::string key) { recomp_key_ = std::move(key); }
++
+   uint32_t entry_point() const { return entry_point_; }
+   uint32_t stack_size() const { return stack_size_; }
+ 
+@@ -109,6 +115,7 @@ class UserModule : public XModule {
+   bool is_dll_module_ = false;
+ 
+   bool evicted_ = false;
++  std::string recomp_key_;
+   uint32_t entry_point_ = 0;
+   uint32_t stack_size_ = 0;
+ };
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 04708d6..edf3c09 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -709,10 +709,23 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+   // can't hold the global lock across LoadFromFile or DllMain ATTACH.
+   {
+     auto global_lock = global_critical_region_.Acquire();
++    // The same recompiled DLL can be asked for by another path (another
++    // device, or the title update's copy): it is the module already loaded.
++    auto recomp_key = FindRecompiledModule(path);
+     for (auto& existing_module : user_modules_) {
+-      if (!existing_module->evicted() && existing_module->path() == path) {
++      if (existing_module->evicted()) {
++        continue;
++      }
++      if (existing_module->path() == path) {
+         return existing_module;
+       }
++      if (recomp_key) {
++        if (existing_module->recomp_key() == recomp_key->guest_path) {
++          REXSYS_INFO("LoadUserModule: '{}' is already loaded as '{}'", path,
++                      existing_module->path());
++          return existing_module;
++        }
++      }
+     }
+     auto [it, inserted] = loading_paths_.emplace(path);
+     (void)it;
+@@ -800,6 +813,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+           auto lib_it = module_libraries_.find(lib_key);
+           assert_true(lib_it != module_libraries_.end());
+           lib_it->second = std::move(library_local);
++          module->set_recomp_key(lib_key);
+           wired_recomp = true;
+         }
+       }
+@@ -859,10 +873,9 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+     auto global_lock = global_critical_region_.Acquire();
+ 
+     // An evicted module's recompiled code was unregistered when it was
+-    // evicted; the same path may be loaded again by now, so leave that alone.
+-    auto recomp = module->evicted() ? std::nullopt : FindRecompiledModule(module->path());
+-    if (recomp) {
+-      const std::string& key = recomp->guest_path;
++    // evicted; the same DLL may be loaded again by now, so leave that alone.
++    if (!module->evicted() && !module->recomp_key().empty()) {
++      const std::string key = module->recomp_key();
+       auto cleared_range = function_dispatcher_->UnregisterModule(key);
+       if (cleared_range) {
+         for (auto& km : kernel_modules_) {
+@@ -870,12 +883,10 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+         }
+       }
+ 
+-      if (!recomp->shared_lib_name.empty()) {
+-        auto lib_it = module_libraries_.find(key);
+-        if (lib_it != module_libraries_.end()) {
+-          deferred_unload_libraries_.push_back(std::move(lib_it->second));
+-          module_libraries_.erase(lib_it);
+-        }
++      auto lib_it = module_libraries_.find(key);
++      if (lib_it != module_libraries_.end()) {
++        deferred_unload_libraries_.push_back(std::move(lib_it->second));
++        module_libraries_.erase(lib_it);
+       }
+     }
+ 
+@@ -921,8 +932,8 @@ void KernelState::EvictOverlappingModules(UserModule& module) {
+                 module.path(), existing->path(), other_begin, other_end);
+     existing->set_evicted();
+     other->DisownImage();
+-    if (auto recomp = FindRecompiledModule(existing->path())) {
+-      const std::string& key = recomp->guest_path;
++    if (!existing->recomp_key().empty()) {
++      const std::string key = existing->recomp_key();
+       if (auto cleared_range = function_dispatcher_->UnregisterModule(key)) {
+         for (auto& km : kernel_modules_) {
+           km->InvalidateThunkCacheInRange(cleared_range->first, cleared_range->second);
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..49b961d 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -245,8 +245,8 @@ target_compile_options(imgui PRIVATE -w)
+ # SDL3 - Cross-platform media layer
+ #=============================================================================
+ set(SDL_INSTALL ON CACHE BOOL "" FORCE)
+-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+-set(SDL_STATIC ON CACHE BOOL "" FORCE)
++set(SDL_SHARED ON CACHE BOOL "" FORCE)
++set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+ set(SDL_TEST OFF CACHE BOOL "" FORCE)
+ set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+ 

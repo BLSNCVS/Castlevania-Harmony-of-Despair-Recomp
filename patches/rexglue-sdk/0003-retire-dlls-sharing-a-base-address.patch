@@ -1,0 +1,163 @@
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 7e9799d..c09aeac 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -395,6 +395,9 @@ class KernelState {
+ 
+   uint32_t kernel_guest_globals_ = 0;
+ 
++  // Retires loaded DLLs whose image overlaps `module`'s (see the .cpp).
++  void EvictOverlappingModules(UserModule& module);
++
+   AchievementManager achievement_manager_;
+   SystemUIHandler achievements_ui_handler_;
+ 
+diff --git a/include/rex/system/user_module.h b/include/rex/system/user_module.h
+index 49c7696..c1abe63 100644
+--- a/include/rex/system/user_module.h
++++ b/include/rex/system/user_module.h
+@@ -59,6 +59,12 @@ class UserModule : public XModule {
+   bool is_executable() const { return processor_module_->is_executable(); }
+   bool is_dll_module() const { return is_dll_module_; }
+ 
++  // Set when another DLL was loaded over this one's image (see
++  // KernelState::EvictOverlappingModules). Its code is gone: lookups skip it
++  // and unloading it only drops the guest's handle.
++  bool evicted() const { return evicted_; }
++  void set_evicted() { evicted_ = true; }
++
+   uint32_t entry_point() const { return entry_point_; }
+   uint32_t stack_size() const { return stack_size_; }
+ 
+@@ -101,6 +107,8 @@ class UserModule : public XModule {
+   ModuleFormat module_format_ = kModuleFormatUndefined;
+ 
+   bool is_dll_module_ = false;
++
++  bool evicted_ = false;
+   uint32_t entry_point_ = 0;
+   uint32_t stack_size_ = 0;
+ };
+diff --git a/include/rex/system/xex_module.h b/include/rex/system/xex_module.h
+index 2ba62d7..075b534 100644
+--- a/include/rex/system/xex_module.h
++++ b/include/rex/system/xex_module.h
+@@ -64,6 +64,8 @@ class XexModule : public Module {
+   virtual ~XexModule();
+ 
+   bool loaded() const { return loaded_; }
++  // Another module now occupies this image's memory; Unload must not free it.
++  void DisownImage() { loaded_ = false; }
+   const xex2_header* xex_header() const {
+     return reinterpret_cast<const xex2_header*>(xex_header_mem_.data());
+   }
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index e13d0a9..04708d6 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -537,7 +537,7 @@ object_ref<XModule> KernelState::GetModule(const std::string_view name, bool use
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     for (auto user_module : user_modules_) {
+-      if (user_module->Matches(path)) {
++      if (!user_module->evicted() && user_module->Matches(path)) {
+         return retain_object(user_module.get());
+       }
+     }
+@@ -710,7 +710,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     for (auto& existing_module : user_modules_) {
+-      if (existing_module->path() == path) {
++      if (!existing_module->evicted() && existing_module->path() == path) {
+         return existing_module;
+       }
+     }
+@@ -741,6 +741,10 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+ 
+   module->Dump();
+ 
++  if (module->is_dll_module()) {
++    EvictOverlappingModules(*module);
++  }
++
+   // Wire recompiled code (if any) before publishing to user_modules_, so a
+   // failure in this block leaves no half-loaded entry behind.
+   auto recomp = FindRecompiledModule(path);
+@@ -839,7 +843,7 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool call_entry) {
+   // Run guest DllMain DETACH outside the global lock to avoid deadlock with
+   // subsystem mutexes acquired from inside the guest callback.
+-  if (module->is_dll_module() && module->entry_point() && call_entry) {
++  if (module->is_dll_module() && module->entry_point() && call_entry && !module->evicted()) {
+     if (!XThread::IsInThread()) {
+       REXSYS_WARN("DllMain(DLL_PROCESS_DETACH) skipped for '{}': not on a guest thread",
+                   module->name());
+@@ -854,7 +858,9 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+   {
+     auto global_lock = global_critical_region_.Acquire();
+ 
+-    auto recomp = FindRecompiledModule(module->path());
++    // An evicted module's recompiled code was unregistered when it was
++    // evicted; the same path may be loaded again by now, so leave that alone.
++    auto recomp = module->evicted() ? std::nullopt : FindRecompiledModule(module->path());
+     if (recomp) {
+       const std::string& key = recomp->guest_path;
+       auto cleared_range = function_dispatcher_->UnregisterModule(key);
+@@ -874,7 +880,7 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+     }
+ 
+     auto iter = std::find_if(user_modules_.begin(), user_modules_.end(),
+-                             [&module](const auto& e) { return e->path() == module->path(); });
++                             [&module](const auto& e) { return e.get() == module.get(); });
+     if (iter != user_modules_.end()) {
+       user_modules_.erase(iter);
+       found_module = true;
+@@ -890,6 +896,47 @@ void KernelState::UnloadUserModule(const object_ref<UserModule>& module, bool ca
+   }
+ }
+ 
++void KernelState::EvictOverlappingModules(UserModule& module) {
++  // An Xbox 360 relocates a DLL whose base address is taken (the images have
++  // .reloc sections). Recompiled code is fixed to its base, so DLLs that share
++  // one can't both be loaded: Harmony of Despair's DLC bosses at 8BF00000 do,
++  // and the game loads the next chapter's DLLs before freeing the last one's.
++  // The console would never run the old copy again before freeing it, so retire
++  // it: its image was just overwritten by LoadFromFile anyway.
++  auto* xex = module.xex_module();
++  const uint32_t begin = xex->base_address();
++  const uint32_t end = begin + xex->image_size();
++  auto global_lock = global_critical_region_.Acquire();
++  for (auto& existing : user_modules_) {
++    if (existing.get() == &module || existing->evicted() || !existing->is_dll_module()) {
++      continue;
++    }
++    auto* other = existing->xex_module();
++    const uint32_t other_begin = other->base_address();
++    const uint32_t other_end = other_begin + other->image_size();
++    if (begin >= other_end || other_begin >= end) {
++      continue;
++    }
++    REXSYS_WARN("Loading '{}' over '{}' ({:08X}-{:08X}); retiring the old module",
++                module.path(), existing->path(), other_begin, other_end);
++    existing->set_evicted();
++    other->DisownImage();
++    if (auto recomp = FindRecompiledModule(existing->path())) {
++      const std::string& key = recomp->guest_path;
++      if (auto cleared_range = function_dispatcher_->UnregisterModule(key)) {
++        for (auto& km : kernel_modules_) {
++          km->InvalidateThunkCacheInRange(cleared_range->first, cleared_range->second);
++        }
++      }
++      auto lib_it = module_libraries_.find(key);
++      if (lib_it != module_libraries_.end()) {
++        deferred_unload_libraries_.push_back(std::move(lib_it->second));
++        module_libraries_.erase(lib_it);
++      }
++    }
++  }
++}
++
+ void KernelState::RegisterRecompiledModule(const char* pe_name, const char* guest_path,
+                                            const char* shared_lib_name) {
+   auto global_lock = global_critical_region_.Acquire();

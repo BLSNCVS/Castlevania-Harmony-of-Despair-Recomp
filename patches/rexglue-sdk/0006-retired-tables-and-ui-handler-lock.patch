@@ -1,0 +1,87 @@
+diff --git a/include/rex/system/function_dispatcher.h b/include/rex/system/function_dispatcher.h
+index 73f71f0..554d829 100644
+--- a/include/rex/system/function_dispatcher.h
++++ b/include/rex/system/function_dispatcher.h
+@@ -77,7 +77,8 @@ class FunctionDispatcher : public IModuleRegistrar {
+   // Shared thunk region size per module.
+   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
+ 
+-  // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE)
++  // rexglue function table management (per-module host table, see
++  // Memory::InitializeFunctionTable)
+   // Set is_entrypoint=true exactly once for the host-loaded entrypoint so
+   // AllocateThunk(caller_address=0) can route to its pool.
+   // host_table: see Memory::InitializeFunctionTable (PPCImageInfo::function_table).
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index c09aeac..9b3d98e 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -337,10 +337,16 @@ class KernelState {
+   // thread and calls `closed` once the player leaves it. Without one the call
+   // does nothing, as before.
+   using SystemUIHandler = std::function<void(std::function<void()> closed)>;
++  // Set on the UI thread, read on game threads: both under a lock, and the
++  // reader gets its own copy.
+   void SetAchievementsUIHandler(SystemUIHandler handler) {
++    std::lock_guard lock(achievements_ui_handler_mutex_);
+     achievements_ui_handler_ = std::move(handler);
+   }
+-  const SystemUIHandler& achievements_ui_handler() const { return achievements_ui_handler_; }
++  SystemUIHandler achievements_ui_handler() const {
++    std::lock_guard lock(achievements_ui_handler_mutex_);
++    return achievements_ui_handler_;
++  }
+ 
+   using AchievementUnlockCallback = std::function<void(const AchievementInfo&)>;
+   AchievementListenerHandle RegisterAchievementUnlockCallback(AchievementUnlockCallback cb);
+@@ -400,6 +406,7 @@ class KernelState {
+ 
+   AchievementManager achievement_manager_;
+   SystemUIHandler achievements_ui_handler_;
++  mutable std::mutex achievements_ui_handler_mutex_;
+ 
+   std::atomic<bool> dispatch_thread_running_;
+   std::atomic<bool> terminating_title_{false};
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 4e6fa16..ff75507 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -589,6 +589,8 @@ class Memory {
+     std::unique_ptr<PPCFunc*[]> host_entries;
+   };
+   std::vector<FunctionTableEntry> function_tables_;
++  // Host tables of unloaded modules, kept until shutdown (DestroyFunctionTable).
++  std::vector<std::unique_ptr<PPCFunc*[]>> retired_host_tables_;
+   mutable std::mutex function_tables_mutex_;
+ 
+   rex::memory::FileMappingHandle mapping_ = rex::memory::kFileMappingHandleInvalid;
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 6d3cb1b..e829ca4 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -563,7 +563,7 @@ uint32_t XamShowMessageBoxUIEx_entry() {
+ u32 XamShowAchievementsUI_entry(u32 user_index) {
+   auto* kernel_state = REX_KERNEL_STATE();
+   auto* app_context = kernel_state->emulator()->app_context();
+-  const auto& handler = kernel_state->achievements_ui_handler();
++  auto handler = kernel_state->achievements_ui_handler();
+   if (!handler || !app_context) {
+     REXKRNL_WARN("XamShowAchievementsUI({}): no achievements UI", uint32_t(user_index));
+     return X_ERROR_SUCCESS;
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index ada25db..9a43d22 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -852,7 +852,11 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
+       return false;
+     }
+     if (it->host_table) {
+-      *it->host_table = nullptr;
++      // A guest thread may still be finishing the retired module's code
++      // (see KernelState::EvictOverlappingModules), so the module keeps
++      // its table pointer and the entries live until shutdown; only the
++      // address range is released for the module that replaces it.
++      retired_host_tables_.push_back(std::move(it->host_entries));
+       function_tables_.erase(it);
+       return true;
+     }

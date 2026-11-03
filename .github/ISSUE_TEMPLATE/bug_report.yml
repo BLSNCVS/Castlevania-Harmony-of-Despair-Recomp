@@ -1,0 +1,58 @@
+name: Bug report
+description: A crash, a glitch, or something that doesn't work.
+labels: [bug]
+body:
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before you post
+      options:
+        - label: My game files come from my own console, and I'm not attaching any of them.
+          required: true
+        - label: I checked the open issues first.
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you were doing and what went wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start a new game with Alucard
+        2. Enter chapter 3
+        3. ...
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows 11, Windows 10, Linux]
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      placeholder: RTX 4070, driver 566.36
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Harmony Recomp version or commit
+      placeholder: v1.0.0 or the commit hash you built
+  - type: dropdown
+    id: content
+    attributes:
+      label: What's installed
+      multiple: true
+      options: [Title update, DLC characters, DLC chapters]
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Drag in the newest file from the game's logs folder. It has your user name in it; blank that out if you want.

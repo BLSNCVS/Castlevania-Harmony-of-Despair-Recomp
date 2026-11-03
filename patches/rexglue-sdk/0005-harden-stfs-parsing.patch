@@ -1,0 +1,97 @@
+diff --git a/src/filesystem/devices/stfs_container_device.cpp b/src/filesystem/devices/stfs_container_device.cpp
+index 7062520..04cefc2 100644
+--- a/src/filesystem/devices/stfs_container_device.cpp
++++ b/src/filesystem/devices/stfs_container_device.cpp
+@@ -568,15 +568,23 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+         break;
+       }
+ 
++      // Untrusted file table: the parent must be a directory listed before,
++      // and the name must fit its field.
+       StfsContainerEntry* parent_entry = nullptr;
+       if (dir_entry.directory_index == 0xFFFF) {
+         parent_entry = root_entry;
+-      } else {
++      } else if (dir_entry.directory_index < all_entries.size() &&
++                 (all_entries[dir_entry.directory_index]->attributes() & kFileAttributeDirectory)) {
+         parent_entry = all_entries[dir_entry.directory_index];
++      } else {
++        REXFS_ERROR("ReadSTFS: entry {} has an invalid parent directory {}", all_entries.size(),
++                    uint16_t(dir_entry.directory_index));
++        return Error::kErrorDamagedFile;
+       }
+ 
+       std::string name(reinterpret_cast<const char*>(dir_entry.name),
+-                       dir_entry.flags.name_length & 0x3F);
++                       std::min<size_t>(dir_entry.flags.name_length & 0x3F,
++                                        sizeof(dir_entry.name)));
+       auto entry = StfsContainerEntry::Create(this, parent_entry, name, &files_);
+ 
+       if (dir_entry.flags.directory) {
+@@ -601,35 +609,29 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+       // of some memory. Nasty chain walk.
+       // TODO(benvanik): optimize if flags.contiguous is set.
+       if (entry->attributes() & system::X_FILE_ATTRIBUTE_NORMAL) {
++        // A chain can't be longer than the blocks the entry claims, nor than
++        // the package: a looping chain in a damaged or crafted package would
++        // otherwise make one block stand for gigabytes.
++        const size_t max_blocks = std::min<size_t>(dir_entry.allocated_data_blocks(),
++                                                   descriptor.total_block_count);
+         uint32_t block_index = dir_entry.start_block_number();
+         size_t remaining_size = dir_entry.length;
+         while (remaining_size && block_index != kEndOfChain) {
++          if (entry->block_list_.size() >= max_blocks) break;
+           size_t block_size = std::min(static_cast<size_t>(kBlockSize), remaining_size);
+           size_t offset = BlockToOffsetSTFS(block_index);
+           entry->block_list_.push_back({0, offset, block_size});
+           remaining_size -= block_size;
+           auto block_hash = GetBlockHash(block_index);
++          if (!block_hash) return Error::kErrorReadError;
+           block_index = block_hash->level0_next_block();
+         }
+ 
+-        if (remaining_size) {
+-          // Loop above must have exited prematurely, bad hash tables?
+-          REXFS_WARN(
+-              "STFS file {} only found {} bytes for file, expected {} ({} "
+-              "bytes missing)",
+-              name, dir_entry.length.get() - remaining_size, dir_entry.length.get(),
+-              remaining_size);
+-          assert_always();
+-        }
+-
+-        // Check that the number of blocks retrieved from hash entries matches
+-        // the block count read from the file entry
+-        if (entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
+-          REXFS_WARN(
+-              "STFS failed to read correct block-chain for entry {}, read {} "
+-              "blocks, expected {}",
+-              entry->name_, entry->block_list_.size(), dir_entry.allocated_data_blocks());
+-          assert_always();
++        if (remaining_size || entry->block_list_.size() != dir_entry.allocated_data_blocks()) {
++          REXFS_ERROR(
++              "STFS file {}: its block chain has {} of its {} blocks; the package is damaged",
++              name, entry->block_list_.size(), dir_entry.allocated_data_blocks());
++          return Error::kErrorDamagedFile;
+         }
+       }
+ 
+@@ -637,6 +639,7 @@ StfsContainerDevice::Error StfsContainerDevice::ReadSTFS() {
+     }
+ 
+     auto block_hash = GetBlockHash(table_block_index);
++    if (!block_hash) return Error::kErrorReadError;
+     table_block_index = block_hash->level0_next_block();
+     if (table_block_index == kEndOfChain) {
+       break;
+@@ -788,7 +791,10 @@ const StfsHashEntry* StfsContainerDevice::GetBlockHash(uint32_t block_index) {
+ }
+ 
+ XContentPackageType StfsContainerDevice::ReadMagic(const std::filesystem::path& path) {
++  std::error_code ec;
++  if (std::filesystem::file_size(path, ec) < 4 || ec) return XContentPackageType(0);
+   auto map = memory::MappedMemory::Open(path, memory::MappedMemory::Mode::kRead, 0, 4);
++  if (!map) return XContentPackageType(0);
+   return XContentPackageType(memory::load_and_swap<uint32_t>(map->data()));
+ }
+ 

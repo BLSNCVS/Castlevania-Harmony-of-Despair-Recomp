@@ -1,0 +1,298 @@
+diff --git a/include/rex/image_info.h b/include/rex/image_info.h
+index e511437..af731d2 100644
+--- a/include/rex/image_info.h
++++ b/include/rex/image_info.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <rex/ppc/func.h>
+ #include <rex/types.h>
+ 
+ struct PPCFuncMapping;
+@@ -47,6 +48,10 @@ struct PPCImageInfo {
+   bool rexcrt_heap = false;  ///< Set by codegen when [rexcrt] has heap functions
+   RegisterModulesFunc register_modules = nullptr;  ///< Set by codegen for multi-binary projects
+   PPCCodegenFlags codegen_flags{};                 ///< Set by codegen from the config flags
++  /// Set by codegen: the module's host-side indirect-call table pointer. The
++  /// runtime allocates the table and stores it here. Null means the legacy
++  /// guest-memory table at image_base + image_size.
++  PPCFunc*** function_table = nullptr;
+ };
+ 
+ }  // namespace rex
+diff --git a/include/rex/system/function_dispatcher.h b/include/rex/system/function_dispatcher.h
+index 916f3d6..73f71f0 100644
+--- a/include/rex/system/function_dispatcher.h
++++ b/include/rex/system/function_dispatcher.h
+@@ -80,8 +80,10 @@ class FunctionDispatcher : public IModuleRegistrar {
+   // rexglue function table management (per-module table at IMAGE_BASE + IMAGE_SIZE)
+   // Set is_entrypoint=true exactly once for the host-loaded entrypoint so
+   // AllocateThunk(caller_address=0) can route to its pool.
++  // host_table: see Memory::InitializeFunctionTable (PPCImageInfo::function_table).
+   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
+-                               uint32_t image_size, bool is_entrypoint = false);
++                               uint32_t image_size, bool is_entrypoint = false,
++                               ::PPCFunc*** host_table = nullptr);
+   bool SetFunction(uint32_t guest_address, ::PPCFunc* func) override;
+   ::PPCFunc* GetFunction(uint32_t guest_address);
+   bool HasAnyFunctionTable() const { return !module_tables_.empty(); }
+@@ -120,6 +122,7 @@ class FunctionDispatcher : public IModuleRegistrar {
+     uint32_t code_size;
+     uint32_t image_base;
+     uint32_t image_size;
++    uint32_t table_end;  // end of image plus guest-memory table, if any
+     uint32_t next_thunk_address;
+     uint32_t thunk_limit;
+   };
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..4e6fa16 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -547,11 +547,13 @@ class Memory {
+   //==========================================================================
+   // Recompiled Code Function Table API
+   //==========================================================================
+-  // Per-module function dispatch table at IMAGE_BASE + IMAGE_SIZE, indexed by
+-  // (guest_addr - code_base) * 2. Internally locked: callers may invoke from
+-  // any thread.
++  // Per-module function dispatch table. With host_table set, a host array
++  // indexed by (guest_addr - code_base) / 4 is allocated and published through
++  // *host_table; otherwise the legacy table at IMAGE_BASE + IMAGE_SIZE in guest
++  // memory, indexed by (guest_addr - code_base) * 2. Internally locked:
++  // callers may invoke from any thread.
+   bool InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
+-                               uint32_t image_size);
++                               uint32_t image_size, PPCFunc*** host_table = nullptr);
+   bool DestroyFunctionTable(uint32_t code_base);
+   // Returns false if guest_address is outside every registered module range.
+   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);
+@@ -583,6 +585,8 @@ class Memory {
+     uint32_t code_base;
+     uint32_t code_size;
+     uint32_t thunk_reserve;
++    PPCFunc*** host_table;  // null for a guest-memory table
++    std::unique_ptr<PPCFunc*[]> host_entries;
+   };
+   std::vector<FunctionTableEntry> function_tables_;
+   mutable std::mutex function_tables_mutex_;
+diff --git a/resources/templates/codegen/_indirect_call.inja b/resources/templates/codegen/_indirect_call.inja
+index d4b1830..787aff8 100644
+--- a/resources/templates/codegen/_indirect_call.inja
++++ b/resources/templates/codegen/_indirect_call.inja
+@@ -1,8 +1,8 @@
+ //=============================================================================
+ // Indirect Call Dispatch
+ //
+-// REX_LOOKUP_FUNC indexes into the per-module dispatch table at
+-// IMAGE_BASE + IMAGE_SIZE. REX_CALL_INDIRECT_FUNC bounds-checks the target
++// REX_LOOKUP_FUNC indexes into the per-module host dispatch table
++// (PPCFunctionTable, one entry per instruction). REX_CALL_INDIRECT_FUNC bounds-checks the target
+ // against the caller's [REX_CODE_BASE, REX_CODE_BASE + REX_CODE_SIZE +
+ // REX_THUNK_RESERVE_SIZE) range; out-of-bounds targets and in-bounds
+ // unregistered slots fall back to rex::runtime::ResolveIndirectFunction,
+@@ -16,8 +16,7 @@
+ #define REX_PROFILE_INDIRECT_DISPATCH()
+ #endif
+ 
+-#define REX_LOOKUP_FUNC(x, y) \
+-  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (u64(u32(y) - REX_CODE_BASE) * 2)))
++#define REX_LOOKUP_FUNC(x, y) (PPCFunctionTable[(u32(y) - u32(REX_CODE_BASE)) / 4])
+ 
+ #define REX_CALL_INDIRECT_FUNC(x)                                                          \
+   do {                                                                                     \
+diff --git a/resources/templates/codegen/init_cpp.inja b/resources/templates/codegen/init_cpp.inja
+index 1be4759..6bd94d1 100644
+--- a/resources/templates/codegen/init_cpp.inja
++++ b/resources/templates/codegen/init_cpp.inja
+@@ -7,6 +7,8 @@
+ void RegisterRecompiledModules(rex::system::KernelState*);
+ {% endif %}
+ 
++PPCFunc** PPCFunctionTable = nullptr;
++
+ const rex::PPCImageInfo PPCImageConfig = {
+     .code_base = REX_CODE_BASE,
+     .code_size = REX_CODE_SIZE,
+@@ -27,6 +29,7 @@ const rex::PPCImageInfo PPCImageConfig = {
+         .non_argument_as_local = {{ config_flags.non_argument_as_local }},
+         .non_volatile_as_local = {{ config_flags.non_volatile_as_local }},
+     },
++    .function_table = &PPCFunctionTable,
+ };
+ 
+ PPCFuncMapping PPCFuncMappings[] = {
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..e8e9705 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -52,6 +52,14 @@
+ extern const rex::PPCImageInfo PPCImageConfig;
+ extern PPCFuncMapping PPCFuncMappings[];
+ 
++// This module's indirect-call table, allocated by the runtime in host memory
++// (PPCImageInfo::function_table). Hidden so each module binds its own.
++#if defined(_WIN32)
++extern PPCFunc** PPCFunctionTable;
++#else
++extern __attribute__((visibility("hidden"))) PPCFunc** PPCFunctionTable;
++#endif
++
+ //=============================================================================
+ // Function Definition Macros
+ //=============================================================================
+diff --git a/resources/templates/codegen/register_cpp.inja b/resources/templates/codegen/register_cpp.inja
+index 0be31c4..dd9123a 100644
+--- a/resources/templates/codegen/register_cpp.inja
++++ b/resources/templates/codegen/register_cpp.inja
+@@ -21,8 +21,8 @@ void {{ project }}_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar)
+ {% endif %}{% endfor %}}
+ 
+ {% if is_dll %}
+-// The runtime uses this baked layout for the dispatch table. It must match the
+-// constants used by this module's REX_LOOKUP_FUNC macro.
++// The runtime uses this baked layout for the dispatch table and allocates the
++// table REX_LOOKUP_FUNC reads through its function_table member.
+ extern "C" REX_MODULE_EXPORT
+ const rex::PPCImageInfo* ReXModule_GetImageInfo() {
+   return &PPCImageConfig;
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..7a22fb6 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -181,7 +181,7 @@ uint64_t FunctionDispatcher::ExecuteInterrupt(ThreadState* thread_state, uint32_
+ 
+ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t code_size,
+                                                  uint32_t image_base, uint32_t image_size,
+-                                                 bool is_entrypoint) {
++                                                 bool is_entrypoint, ::PPCFunc*** host_table) {
+   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+ 
+   if (is_entrypoint && entrypoint_code_base_ != 0) {
+@@ -190,11 +190,11 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
+     return false;
+   }
+ 
+-  uint32_t new_table_end = image_base + image_size + (code_size + kThunkReserveSize) * 2;
++  uint32_t new_table_end =
++      image_base + image_size + (host_table ? 0 : (code_size + kThunkReserveSize) * 2);
+   uint32_t new_code_end = code_base + code_size + kThunkReserveSize;
+   for (const auto& existing : module_tables_) {
+-    uint32_t existing_table_end =
+-        existing.image_base + existing.image_size + (existing.code_size + kThunkReserveSize) * 2;
++    uint32_t existing_table_end = existing.table_end;
+     uint32_t existing_code_end = existing.code_base + existing.code_size + kThunkReserveSize;
+     if (image_base < existing_table_end && new_table_end > existing.image_base) {
+       REXLOG_ERROR("Module image range [{:08X}, {:08X}) overlaps existing [{:08X}, {:08X})",
+@@ -208,7 +208,8 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
+     }
+   }
+ 
+-  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size)) {
++  if (!memory_->InitializeFunctionTable(code_base, code_size, image_base, image_size,
++                                        host_table)) {
+     REXLOG_ERROR("Failed to initialize guest memory function table");
+     return false;
+   }
+@@ -218,6 +219,7 @@ bool FunctionDispatcher::InitializeFunctionTable(uint32_t code_base, uint32_t co
+       .code_size = code_size,
+       .image_base = image_base,
+       .image_size = image_size,
++      .table_end = new_table_end,
+       .next_thunk_address = code_base + code_size,
+       .thunk_limit = code_base + code_size + kThunkReserveSize,
+   });
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..e13d0a9 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -787,7 +787,8 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+               xex->base_address() + xex->image_size());
+         } else if (!function_dispatcher_->InitializeFunctionTable(
+                        image_info->code_base, image_info->code_size, image_info->image_base,
+-                       image_info->image_size)) {
++                       image_info->image_size, /*is_entrypoint=*/false,
++                       image_info->function_table)) {
+           REXSYS_ERROR("InitializeFunctionTable failed for module '{}'", recomp->pe_name);
+         } else {
+           function_dispatcher_->RegisterModule(lib_key, image_info->code_base, register_func);
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..d619db1 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -207,7 +207,8 @@ X_STATUS Runtime::Setup(const rex::PPCImageInfo& image_info, RuntimeConfig confi
+ 
+   if (!function_dispatcher_->InitializeFunctionTable(image_info.code_base, image_info.code_size,
+                                                      image_info.image_base, image_info.image_size,
+-                                                     /*is_entrypoint=*/true)) {
++                                                     /*is_entrypoint=*/true,
++                                                     image_info.function_table)) {
+     REXSYS_ERROR("Failed to initialize function table");
+     Shutdown();
+     return X_STATUS_UNSUCCESSFUL;
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..ada25db 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -785,8 +785,28 @@ bool Memory::Restore(stream::ByteStream* stream) {
+ //=============================================================================
+ 
+ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uint32_t image_base,
+-                                     uint32_t image_size) {
++                                     uint32_t image_size, PPCFunc*** host_table) {
+   constexpr uint32_t kThunkReserveSize = runtime::FunctionDispatcher::kThunkReserveSize;
++  if (host_table) {
++    // Host tables keep guest memory past the image free: DLLs the game loads
++    // later may be placed right after it.
++    size_t count = (size_t(code_size) + kThunkReserveSize) / 4;
++    auto entries = std::make_unique<PPCFunc*[]>(count);  // value-initialized: null
++    REXSYS_DEBUG("Initializing host function table ({} entries) for code {:08X}-{:08X}", count,
++                 code_base, code_base + code_size);
++    std::lock_guard lock(function_tables_mutex_);
++    *host_table = entries.get();
++    function_tables_.push_back({
++        .table_base = 0,
++        .code_base = code_base,
++        .code_size = code_size,
++        .thunk_reserve = kThunkReserveSize,
++        .host_table = host_table,
++        .host_entries = std::move(entries),
++    });
++    return true;
++  }
++
+   uint32_t table_base = image_base + image_size;
+   uint32_t table_size = (code_size + kThunkReserveSize) * 2;
+ 
+@@ -811,6 +831,8 @@ bool Memory::InitializeFunctionTable(uint32_t code_base, uint32_t code_size, uin
+       .code_base = code_base,
+       .code_size = code_size,
+       .thunk_reserve = kThunkReserveSize,
++      .host_table = nullptr,
++      .host_entries = nullptr,
+   });
+ 
+   return true;
+@@ -829,6 +851,11 @@ bool Memory::DestroyFunctionTable(uint32_t code_base) {
+     if (it == function_tables_.end()) {
+       return false;
+     }
++    if (it->host_table) {
++      *it->host_table = nullptr;
++      function_tables_.erase(it);
++      return true;
++    }
+     table_base = it->table_base;
+     table_size = (it->code_size + it->thunk_reserve) * 2;
+     logged_code_base = it->code_base;
+@@ -850,6 +877,10 @@ bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
+     for (const auto& entry : function_tables_) {
+       uint32_t range_end = entry.code_base + entry.code_size + entry.thunk_reserve;
+       if (guest_address >= entry.code_base && guest_address < range_end) {
++        if (entry.host_entries) {
++          entry.host_entries[(guest_address - entry.code_base) / 4] = host_function;
++          return true;
++        }
+         uint64_t offset = (uint64_t(guest_address) - entry.code_base) * 2;
+         table_address = entry.table_base + uint32_t(offset);
+         break;

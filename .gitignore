@@ -1,0 +1,29 @@
+# Build output
+/out/
+/logs/
+CMakeUserPresets.json
+
+# The SDK checkout made by scripts/setup_sdk.sh
+/thirdparty/
+
+# User-provided game data: never commit anything from a dump.
+/game/*
+!/game/README.txt
+/update/
+/modules/
+*.xex
+*.xexp
+*.dllp
+
+# Packaged builds (scripts/build_windows.ps1) hold the installed game, saves
+# and recompiled code.
+/dist/
+
+# Recompiled game code is derived from the user's default.xex. passes/ holds
+# the extra codegen manifests 'hodtool stage-modules' writes for DLLs that
+# share an address range.
+/generated/*
+!/generated/rexglue.cmake
+/passes/
+# Built from config/manifest_base.toml by 'hodtool stage-modules'.
+/hodrecomp_manifest.toml

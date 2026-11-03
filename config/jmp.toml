@@ -1,0 +1,7 @@
+# setjmp/longjmp addresses for the codegen.
+#
+# default.xex (TU 0.0.2.4, see docs/SUPPORTED_DUMPS.md) does not appear to use
+# setjmp/longjmp: 'hodtool scan' finds no setjmp-shaped function, and the only
+# longjmp-shaped one (0x8276229C) restores a full CONTEXT record from r4 and
+# has a single caller in the C++ exception-unwinding code. It is the unwinder's
+# context restore, not longjmp, so both addresses stay unset.

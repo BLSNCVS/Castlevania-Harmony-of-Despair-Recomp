@@ -1,0 +1,4 @@
+This file turns on portable mode: saves, DLC, settings caches and the shader
+cache are kept in the "user" folder next to hodrecomp.exe, so the whole game
+is this one folder. Delete this file to keep them in Documents\hodrecomp
+instead (move the "user" folder there to keep your saves).
